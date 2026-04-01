@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+playwright
+google-cloud-storage
+python-dotenv
