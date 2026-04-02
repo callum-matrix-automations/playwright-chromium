@@ -57,12 +57,87 @@ LAUNCH_ARGS = [
 ]
 
 
+COOKIE_DISMISS_JS = """
+() => {
+    // Common cookie consent selectors
+    const selectors = [
+        '[class*="cookie"] button[class*="accept"]',
+        '[class*="cookie"] button[class*="Allow"]',
+        '[class*="cookie"] button[class*="agree"]',
+        '[class*="consent"] button[class*="accept"]',
+        '[class*="consent"] button[class*="Allow"]',
+        '[class*="consent"] button[class*="agree"]',
+        '#onetrust-accept-btn-handler',
+        '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+        '.cc-accept', '.cc-allow', '.cc-dismiss',
+        'button[data-cookiefirst-action="accept"]',
+        '[aria-label="Accept cookies"]',
+        '[aria-label="Accept all cookies"]',
+        'button:has-text("Accept")',
+    ];
+    for (const sel of selectors) {
+        try {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); return true; }
+        } catch {}
+    }
+    // Fallback: find buttons by text content
+    const buttons = document.querySelectorAll('button, a.btn, a.button, [role="button"]');
+    for (const btn of buttons) {
+        const text = btn.textContent?.trim().toLowerCase() || '';
+        if (text.match(/^(accept|accept all|allow all|agree|got it|ok|i agree)$/)) {
+            btn.click();
+            return true;
+        }
+    }
+    return false;
+}
+"""
+
+HIDE_OVERLAYS_CSS = """
+    [class*="cookie"], [id*="cookie"],
+    [class*="consent"], [id*="consent"],
+    [class*="Cookie"], [id*="Cookie"],
+    [class*="Consent"], [id*="Consent"],
+    .cc-window, #onetrust-banner-sdk,
+    #CybotCookiebotDialog,
+    [class*="gdpr"], [id*="gdpr"] {
+        display: none !important;
+        visibility: hidden !important;
+    }
+"""
+
+SCROLL_PAGE_JS = """
+async () => {
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+    const height = document.body.scrollHeight;
+    const step = window.innerHeight;
+    for (let y = 0; y < height; y += step) {
+        window.scrollTo(0, y);
+        await delay(300);
+    }
+    window.scrollTo(0, 0);
+}
+"""
+
+
 async def capture_screenshot(page, url: str, viewport: dict, is_mobile: bool) -> str:
     await page.set_viewport_size(viewport)
     if is_mobile:
         await page.emulate_media()
     await page.goto(url, wait_until="load", timeout=60000)
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
+
+    # Dismiss cookie banners
+    await page.evaluate(COOKIE_DISMISS_JS)
+    await asyncio.sleep(1)
+
+    # Force-hide any remaining cookie/consent overlays
+    await page.add_style_tag(content=HIDE_OVERLAYS_CSS)
+
+    # Scroll through page to trigger lazy loading and carousels
+    await page.evaluate(SCROLL_PAGE_JS)
+    await asyncio.sleep(2)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp.close()
