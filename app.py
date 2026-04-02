@@ -113,19 +113,18 @@ COOKIE_DISMISS_JS = """
 """
 
 HIDE_OVERLAYS_CSS = """
-    [class*="cookie" i], [id*="cookie" i],
-    [class*="consent" i], [id*="consent" i],
-    [class*="gdpr" i], [id*="gdpr" i],
+    div[class*="cookie" i], div[id*="cookie" i],
+    div[class*="consent" i], div[id*="consent" i],
+    div[class*="gdpr" i], div[id*="gdpr" i],
+    aside[class*="cookie" i], aside[class*="consent" i],
+    section[class*="cookie" i], section[class*="consent" i],
     .cc-window, #onetrust-banner-sdk,
-    #CybotCookiebotDialog, #CybotCookiebotDialogBodyUnderlay,
-    [class*="overlay" i][class*="cookie" i],
-    [class*="banner" i][class*="cookie" i] {
+    #CybotCookiebotDialog, #CybotCookiebotDialogBodyUnderlay {
         display: none !important;
         visibility: hidden !important;
         opacity: 0 !important;
         pointer-events: none !important;
     }
-    /* Remove any backdrop/overlay that blocks content */
     body.cookie-open, body.modal-open {
         overflow: auto !important;
     }
