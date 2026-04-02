@@ -61,7 +61,7 @@ async def capture_screenshot(page, url: str, viewport: dict, is_mobile: bool) ->
     await page.set_viewport_size(viewport)
     if is_mobile:
         await page.emulate_media()
-    await page.goto(url, wait_until="networkidle", timeout=60000)
+    await page.goto(url, wait_until="load", timeout=60000)
     await asyncio.sleep(5)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
