@@ -131,18 +131,28 @@ HIDE_OVERLAYS_CSS = """
     }
 """
 
+FREEZE_ANIMATIONS_JS = """
+() => {
+    // Force all running animations to their end state, then freeze
+    document.getAnimations().forEach(anim => {
+        try {
+            anim.finish();
+        } catch {
+            anim.cancel();
+        }
+    });
+}
+"""
+
 FREEZE_ANIMATIONS_CSS = """
     *, *::before, *::after {
-        animation-duration: 0s !important;
-        animation-delay: 0s !important;
-        animation-iteration-count: 1 !important;
+        animation-play-state: paused !important;
         transition-duration: 0s !important;
         transition-delay: 0s !important;
         scroll-behavior: auto !important;
     }
     /* Ensure carousels show their current slide properly */
     .slick-track, .swiper-wrapper, [class*="carousel"] {
-        transform: none !important;
         transition: none !important;
     }
 """
@@ -230,9 +240,10 @@ async def capture_screenshot(context, url: str) -> str:
     # Wait for all images and fonts to load
     await page.evaluate(WAIT_FOR_IMAGES_JS)
 
-    # Freeze animations so screenshot captures stable state
+    # Force all animations to their end state, then freeze
+    await page.evaluate(FREEZE_ANIMATIONS_JS)
     await page.add_style_tag(content=FREEZE_ANIMATIONS_CSS)
-    await asyncio.sleep(500 / 1000)
+    await asyncio.sleep(0.5)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp.close()
