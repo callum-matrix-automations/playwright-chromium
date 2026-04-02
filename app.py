@@ -253,15 +253,19 @@ async def capture_screenshot(context, url: str) -> str:
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
 async def screenshot(req: ScreenshotRequest):
-    if not req.urls:
-        raise HTTPException(status_code=400, detail="urls list is empty")
+    # Filter out null/empty/invalid URLs
+    valid_urls = [u for u in req.urls if u and u.strip().lower() not in ("null", "none", "undefined", "")]
+    valid_urls = [u for u in valid_urls if u.startswith(("http://", "https://"))]
+
+    if not valid_urls:
+        raise HTTPException(status_code=400, detail="No valid URLs provided")
 
     results: list[ScreenshotResult] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(args=LAUNCH_ARGS)
 
-        for url in req.urls:
+        for url in valid_urls:
             run_id = uuid.uuid4().hex[:12]
             temp_files: list[str] = []
 
