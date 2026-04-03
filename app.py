@@ -42,6 +42,31 @@ class ScreenshotResponse(BaseModel):
     results: list[ScreenshotResult]
 
 
+class ExtractRequest(BaseModel):
+    url: str
+
+
+class LinkItem(BaseModel):
+    href: str
+    anchor: str
+
+
+class ExtractResponse(BaseModel):
+    url: str
+    title: str | None
+    meta_description: str | None
+    canonical: str | None
+    meta_robots: str | None
+    viewport: str | None
+    og_tags: dict[str, str]
+    json_ld: list[dict]
+    headings: dict[str, list[str]]
+    images: dict[str, list[dict]]
+    internal_links: list[LinkItem]
+    external_links: list[LinkItem]
+    word_count: int
+
+
 def upload_to_gcs(local_path: str, destination_blob: str) -> str:
     client = storage.Client(project=GCS_PROJECT)
     bucket = client.bucket(BUCKET_NAME)
@@ -249,6 +274,153 @@ async def capture_screenshot(context, url: str) -> str:
     await page.screenshot(path=tmp.name, full_page=True)
     await page.close()
     return tmp.name
+
+
+EXTRACT_SEO_JS = """
+() => {
+    const getText = sel => {
+        const el = document.querySelector(sel);
+        return el ? el.textContent.trim() : null;
+    };
+    const getAttr = (sel, attr) => {
+        const el = document.querySelector(sel);
+        return el ? el.getAttribute(attr) : null;
+    };
+
+    // Title
+    const title = getText('title');
+
+    // Meta description
+    const metaDescription = getAttr('meta[name="description"]', 'content');
+
+    // Canonical
+    const canonical = getAttr('link[rel="canonical"]', 'href');
+
+    // Meta robots
+    const metaRobots = getAttr('meta[name="robots"]', 'content');
+
+    // Viewport
+    const viewport = getAttr('meta[name="viewport"]', 'content');
+
+    // OG tags
+    const ogTags = {};
+    document.querySelectorAll('meta[property^="og:"]').forEach(el => {
+        ogTags[el.getAttribute('property')] = el.getAttribute('content') || '';
+    });
+
+    // JSON-LD / Schema blocks
+    const jsonLd = [];
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
+        try { jsonLd.push(JSON.parse(el.textContent)); } catch {}
+    });
+
+    // Headings H1-H6
+    const headings = {};
+    for (let i = 1; i <= 6; i++) {
+        const tag = 'h' + i;
+        headings[tag] = Array.from(document.querySelectorAll(tag)).map(el => el.textContent.trim());
+    }
+
+    // Images — split by alt presence
+    const withAlt = [];
+    const missingAlt = [];
+    document.querySelectorAll('img').forEach(img => {
+        const src = img.getAttribute('src');
+        const alt = img.getAttribute('alt');
+        if (alt && alt.trim()) {
+            withAlt.push({ src, alt: alt.trim() });
+        } else {
+            missingAlt.push({ src });
+        }
+    });
+
+    // Links — split internal vs external, include anchor text
+    const baseHost = location.hostname;
+    const internalLinks = [];
+    const externalLinks = [];
+    document.querySelectorAll('a[href]').forEach(a => {
+        try {
+            const href = a.href;
+            if (!href || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+            const anchor = a.textContent.trim();
+            const url = new URL(href, location.origin);
+            if (url.hostname === baseHost || url.hostname.endsWith('.' + baseHost)) {
+                internalLinks.push({ href, anchor });
+            } else {
+                externalLinks.push({ href, anchor });
+            }
+        } catch {}
+    });
+
+    // Word count — visible body text
+    const bodyText = document.body.innerText || '';
+    const wordCount = bodyText.split(/\\s+/).filter(w => w.length > 0).length;
+
+    return {
+        title, metaDescription, canonical, metaRobots, viewport,
+        ogTags, jsonLd, headings,
+        images: { with_alt: withAlt, missing_alt: missingAlt },
+        internalLinks, externalLinks, wordCount
+    };
+}
+"""
+
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract(req: ExtractRequest):
+    url = req.url.strip()
+    if not url or not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=LAUNCH_ARGS)
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        page = await context.new_page()
+
+        # Block tracking/analytics
+        await page.route("**/*", lambda route: (
+            asyncio.ensure_future(block_tracking(route))
+            if any(p in route.request.url for p in BLOCKED_RESOURCE_PATTERNS)
+            else asyncio.ensure_future(route.continue_())
+        ))
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+        await asyncio.sleep(1)
+
+        # Dismiss cookie banners so they don't pollute the HTML
+        await page.evaluate(COOKIE_DISMISS_JS)
+        await asyncio.sleep(1)
+
+        # Extract SEO elements
+        seo = await page.evaluate(EXTRACT_SEO_JS)
+
+        await context.close()
+        await browser.close()
+
+    return ExtractResponse(
+        url=url,
+        title=seo["title"],
+        meta_description=seo["metaDescription"],
+        canonical=seo["canonical"],
+        meta_robots=seo["metaRobots"],
+        viewport=seo["viewport"],
+        og_tags=seo["ogTags"],
+        json_ld=seo["jsonLd"],
+        headings=seo["headings"],
+        images=seo["images"],
+        internal_links=seo["internalLinks"],
+        external_links=seo["externalLinks"],
+        word_count=seo["wordCount"],
+    )
 
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
