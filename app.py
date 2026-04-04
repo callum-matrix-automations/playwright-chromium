@@ -7,7 +7,7 @@ import uuid
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from google.cloud import storage
@@ -107,6 +107,11 @@ class AuditPageResult(BaseModel):
 
 class AuditResponse(BaseModel):
     results: list[AuditPageResult]
+
+
+class PdfRequest(BaseModel):
+    html: str
+    filename: str | None = None
 
 
 def upload_to_gcs(local_path: str, destination_blob: str) -> str:
@@ -679,6 +684,47 @@ async def audit(req: AuditRequest):
         await browser.close()
 
     return AuditResponse(results=results)
+
+
+@app.post("/pdf")
+async def html_to_pdf(req: PdfRequest):
+    if not req.html or not req.html.strip():
+        raise HTTPException(status_code=400, detail="No HTML provided")
+
+    filename = req.filename or "document.pdf"
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=LAUNCH_ARGS)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        # Load HTML directly — wait for fonts/resources to finish
+        await page.set_content(req.html, wait_until="networkidle", timeout=30000)
+
+        # Ensure web fonts are fully loaded before rendering
+        try:
+            await page.evaluate(
+                "async () => { if (document.fonts && document.fonts.ready) await document.fonts.ready; }"
+            )
+        except Exception:
+            pass
+
+        pdf_bytes = await page.pdf(
+            format="A4",
+            print_background=True,
+            prefer_css_page_size=True,
+        )
+
+        await context.close()
+        await browser.close()
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
