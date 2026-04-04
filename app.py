@@ -67,6 +67,48 @@ class ExtractResponse(BaseModel):
     word_count: int
 
 
+class AuditPageInput(BaseModel):
+    url: str
+    reason: str | None = None
+    in_inventory: bool | None = None
+
+
+class AuditRequest(BaseModel):
+    pages: list[AuditPageInput]
+
+
+class AuditPageResult(BaseModel):
+    url: str
+    status: int | None
+    redirects: list[str]
+    title: str | None
+    meta_desc: str | None
+    canonical: str | None
+    robots: str | None
+    og_title: str | None
+    og_desc: str | None
+    og_image: str | None
+    schema_types: list[str]
+    schema_raw: list[dict]
+    h1: list[str]
+    h2: list[str]
+    h3: list[str]
+    h4: list[str]
+    h5: list[str]
+    h6: list[str]
+    img_alt_ok: int
+    img_alt_missing: int
+    img_alt_bad: list[str]
+    links_internal: int
+    links_external: int
+    word_count: int
+    error: str | None = None
+
+
+class AuditResponse(BaseModel):
+    results: list[AuditPageResult]
+
+
 def upload_to_gcs(local_path: str, destination_blob: str) -> str:
     client = storage.Client(project=GCS_PROJECT)
     bucket = client.bucket(BUCKET_NAME)
@@ -421,6 +463,222 @@ async def extract(req: ExtractRequest):
         external_links=seo["externalLinks"],
         word_count=seo["wordCount"],
     )
+
+
+AUDIT_SEO_JS = """
+() => {
+    const getText = sel => {
+        const el = document.querySelector(sel);
+        return el ? el.textContent.trim() : null;
+    };
+    const getAttr = (sel, attr) => {
+        const el = document.querySelector(sel);
+        return el ? el.getAttribute(attr) : null;
+    };
+
+    const title = getText('title');
+    const metaDesc = getAttr('meta[name="description"]', 'content');
+    const canonical = getAttr('link[rel="canonical"]', 'href');
+    const robots = getAttr('meta[name="robots"]', 'content');
+    const ogTitle = getAttr('meta[property="og:title"]', 'content');
+    const ogDesc = getAttr('meta[property="og:description"]', 'content');
+    const ogImage = getAttr('meta[property="og:image"]', 'content');
+
+    // Schema — collect all types and build simplified summaries
+    const schemaTypes = [];
+    const schemaRaw = [];
+    function walkSchema(obj) {
+        if (!obj || typeof obj !== 'object') return;
+        if (Array.isArray(obj)) { obj.forEach(walkSchema); return; }
+        if (obj['@type']) {
+            const types = Array.isArray(obj['@type']) ? obj['@type'] : [obj['@type']];
+            types.forEach(t => { if (!schemaTypes.includes(t)) schemaTypes.push(t); });
+            const summary = { '@type': obj['@type'] };
+            if (obj['@id']) summary['@id'] = obj['@id'];
+            if (obj.headline) summary.headline = obj.headline;
+            if (obj.name) summary.name = obj.name;
+            if (obj.author) {
+                summary.author = typeof obj.author === 'string' ? obj.author
+                    : obj.author.name || obj.author['@id'] || null;
+            }
+            if (obj.description) summary.description = obj.description;
+            schemaRaw.push(summary);
+        }
+        if (obj['@graph']) walkSchema(obj['@graph']);
+    }
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
+        try { walkSchema(JSON.parse(el.textContent)); } catch {}
+    });
+
+    // Headings — deduplicated, preserve order
+    const headings = {};
+    for (let i = 1; i <= 6; i++) {
+        const seen = new Set();
+        headings['h' + i] = [];
+        document.querySelectorAll('h' + i).forEach(el => {
+            const t = el.textContent.trim().replace(/\\s+/g, ' ');
+            if (t && !seen.has(t)) { seen.add(t); headings['h' + i].push(t); }
+        });
+    }
+
+    // Images — count good/missing, collect bad alt text (filename-like)
+    let altOk = 0, altMissing = 0;
+    const altBadSet = new Set();
+    const badPatterns = /^(img|image|photo|picture|banner|hero|screenshot|logo|icon|untitled|placeholder|dsc|dcl|img_|wp-image|no-?bg|scaled|\\d+x\\d+)/i;
+    document.querySelectorAll('img').forEach(img => {
+        const alt = (img.getAttribute('alt') || '').trim();
+        if (!alt) {
+            altMissing++;
+        } else if (badPatterns.test(alt) || alt.length < 5 || /^[A-Z0-9_\\-. ]+$/.test(alt)) {
+            if (!altBadSet.has(alt)) altBadSet.add(alt);
+            altOk++;
+        } else {
+            altOk++;
+        }
+    });
+
+    // Links — deduplicated counts
+    const baseHost = location.hostname;
+    const internalSet = new Set();
+    const externalSet = new Set();
+    document.querySelectorAll('a[href]').forEach(a => {
+        try {
+            const href = a.href;
+            if (!href || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+            const url = new URL(href, location.origin);
+            const normalized = url.origin + url.pathname.replace(/\\/$/, '');
+            if (url.hostname === baseHost || url.hostname.endsWith('.' + baseHost)) {
+                internalSet.add(normalized);
+            } else {
+                externalSet.add(normalized);
+            }
+        } catch {}
+    });
+
+    // Word count
+    const bodyText = document.body.innerText || '';
+    const wordCount = bodyText.split(/\\s+/).filter(w => w.length > 0).length;
+
+    return {
+        title, metaDesc, canonical, robots,
+        ogTitle, ogDesc, ogImage,
+        schemaTypes, schemaRaw,
+        headings,
+        imgAltOk: altOk, imgAltMissing: altMissing, imgAltBad: Array.from(altBadSet),
+        linksInternal: internalSet.size, linksExternal: externalSet.size,
+        wordCount
+    };
+}
+"""
+
+BATCH_SIZE = 5
+
+
+async def audit_single_page(context, url: str) -> AuditPageResult:
+    """Audit a single page within an existing browser context."""
+    redirects = []
+    final_status = None
+
+    page = await context.new_page()
+
+    # Track redirects
+    page.on("response", lambda resp: (
+        redirects.append(resp.url) if resp.status in range(300, 400) else None
+    ))
+
+    # Block tracking/analytics
+    await page.route("**/*", lambda route: (
+        asyncio.ensure_future(block_tracking(route))
+        if any(p in route.request.url for p in BLOCKED_RESOURCE_PATTERNS)
+        else asyncio.ensure_future(route.continue_())
+    ))
+
+    try:
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        final_status = response.status if response else None
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+        await asyncio.sleep(1)
+        await page.evaluate(COOKIE_DISMISS_JS)
+        await asyncio.sleep(1)
+
+        seo = await page.evaluate(AUDIT_SEO_JS)
+
+        await page.close()
+
+        return AuditPageResult(
+            url=url,
+            status=final_status,
+            redirects=redirects,
+            title=seo["title"],
+            meta_desc=seo["metaDesc"],
+            canonical=seo["canonical"],
+            robots=seo["robots"],
+            og_title=seo["ogTitle"],
+            og_desc=seo["ogDesc"],
+            og_image=seo["ogImage"],
+            schema_types=seo["schemaTypes"],
+            schema_raw=seo["schemaRaw"],
+            h1=seo["headings"]["h1"],
+            h2=seo["headings"]["h2"],
+            h3=seo["headings"]["h3"],
+            h4=seo["headings"]["h4"],
+            h5=seo["headings"]["h5"],
+            h6=seo["headings"]["h6"],
+            img_alt_ok=seo["imgAltOk"],
+            img_alt_missing=seo["imgAltMissing"],
+            img_alt_bad=seo["imgAltBad"],
+            links_internal=seo["linksInternal"],
+            links_external=seo["linksExternal"],
+            word_count=seo["wordCount"],
+        )
+    except Exception as e:
+        await page.close()
+        return AuditPageResult(
+            url=url,
+            status=final_status,
+            redirects=redirects,
+            title=None, meta_desc=None, canonical=None, robots=None,
+            og_title=None, og_desc=None, og_image=None,
+            schema_types=[], schema_raw=[],
+            h1=[], h2=[], h3=[], h4=[], h5=[], h6=[],
+            img_alt_ok=0, img_alt_missing=0, img_alt_bad=[],
+            links_internal=0, links_external=0, word_count=0,
+            error=str(e),
+        )
+
+
+@app.post("/audit", response_model=AuditResponse)
+async def audit(req: AuditRequest):
+    valid_pages = [p for p in req.pages if p.url and p.url.strip().startswith(("http://", "https://"))]
+    if not valid_pages:
+        raise HTTPException(status_code=400, detail="No valid URLs provided")
+
+    results: list[AuditPageResult] = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=LAUNCH_ARGS)
+
+        # Process in batches of 5
+        for i in range(0, len(valid_pages), BATCH_SIZE):
+            batch = valid_pages[i : i + BATCH_SIZE]
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            batch_results = await asyncio.gather(
+                *[audit_single_page(context, p.url.strip()) for p in batch]
+            )
+            results.extend(batch_results)
+            await context.close()
+
+        await browser.close()
+
+    return AuditResponse(results=results)
 
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
